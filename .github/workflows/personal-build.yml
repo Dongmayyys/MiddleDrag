@@ -51,7 +51,7 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Contents/Info.plist")" = app.middledrag.MiddleDrag
           test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist")" = 1.4.3.1
-          lipo -verify_arch arm64 "$APP/Contents/MacOS/MiddleDrag"
+          lipo "$APP/Contents/MacOS/MiddleDrag" -verify_arch arm64
           otool -L "$APP/Contents/MacOS/MiddleDrag"
           mkdir -p artifact
           ditto -c -k --sequesterRsrc --keepParent "$APP" artifact/MiddleDrag-1.4.3.1-arm64.zip
