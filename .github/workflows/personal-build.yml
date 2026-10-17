@@ -15,12 +15,33 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Verify compiler and wake fix
+      - name: Verify compiler
         run: |
           set -euo pipefail
           xcodebuild -version
           swift --version
-          grep -q 'if unsafe MTDeviceIsRunning(deviceRef)' MiddleDrag/Managers/DeviceMonitor.swift
+      - name: Test device ownership and callback teardown
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -project MiddleDrag.xcodeproj \
+            -scheme MiddleDrag \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath build \
+            -resultBundlePath build/DeviceLifecycleTests.xcresult \
+            -only-testing:MiddleDragCoreTests/DeviceMonitorTests \
+            -parallel-testing-enabled NO \
+            -disableAutomaticPackageResolution \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY='' CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM='' PROVISIONING_PROFILE_SPECIFIER='' \
+            SKIP_INSTALL=YES REGISTER_APP_WITH_LAUNCH_SERVICES=NO \
+            'OTHER_LDFLAGS=-F/System/Library/PrivateFrameworks -framework MultitouchSupport -framework CoreFoundation -framework CoreGraphics' \
+            FRAMEWORK_SEARCH_PATHS=/System/Library/PrivateFrameworks
+          mkdir -p artifact
+          xcrun xcresulttool get test-results summary \
+            --path build/DeviceLifecycleTests.xcresult > artifact/test-summary.json
       - name: Build for Apple silicon
         run: |
           set -euo pipefail
@@ -32,7 +53,7 @@ jobs:
             -derivedDataPath build \
             -disableAutomaticPackageResolution \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
-            MARKETING_VERSION=1.4.3.1 \
+            MARKETING_VERSION=1.4.3.2 \
             PRODUCT_BUNDLE_IDENTIFIER=app.middledrag.MiddleDrag \
             CODE_SIGN_IDENTITY='' CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
             DEVELOPMENT_TEAM='' PROVISIONING_PROFILE_SPECIFIER='' \
@@ -50,12 +71,12 @@ jobs:
           codesign --force --deep --sign - --timestamp=none "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
           test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Contents/Info.plist")" = app.middledrag.MiddleDrag
-          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist")" = 1.4.3.1
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist")" = 1.4.3.2
           lipo "$APP/Contents/MacOS/MiddleDrag" -verify_arch arm64
           otool -L "$APP/Contents/MacOS/MiddleDrag"
           mkdir -p artifact
-          ditto -c -k --sequesterRsrc --keepParent "$APP" artifact/MiddleDrag-1.4.3.1-arm64.zip
-          shasum -a 256 artifact/MiddleDrag-1.4.3.1-arm64.zip > artifact/SHA256SUMS
+          ditto -c -k --sequesterRsrc --keepParent "$APP" artifact/MiddleDrag-1.4.3.2-arm64.zip
+          shasum -a 256 artifact/MiddleDrag-1.4.3.2-arm64.zip > artifact/SHA256SUMS
           python3 - <<'PY'
           import json, os, subprocess
           from pathlib import Path
@@ -65,7 +86,8 @@ jobs:
               "upstream_fix_commit": "3cb680cbb9b2d43666150c8f78a8a2ef60b37f62",
               "run_url": f'https://github.com/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{os.environ["GITHUB_RUN_ID"]}',
               "xcode": subprocess.check_output(["xcodebuild", "-version"], text=True).strip(),
-              "version": "1.4.3.1",
+              "version": "1.4.3.2",
+              "personal_fix": "Retain device owners through serialized stop; avoid duplicate default handles and callback-lock inversion",
               "architecture": "arm64",
               "signing": "ad-hoc; personal build, not notarized by the upstream author"
           }
@@ -74,7 +96,7 @@ jobs:
       - name: Upload app and provenance
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: MiddleDrag-1.4.3.1-arm64
+          name: MiddleDrag-1.4.3.2-arm64
           path: artifact/
           retention-days: 7
           if-no-files-found: error

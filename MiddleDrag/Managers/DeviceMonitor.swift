@@ -10,7 +10,8 @@ import os
 
 // MARK: - Global Callback Storage
 
-// Required because C callbacks cannot capture Swift context
+// The active monitor owns the C callback context until stop(). A callback copies
+// this reference under gCallbackLock, so an in-flight call keeps its context alive.
 @unsafe nonisolated(unsafe) private var gDeviceMonitor: DeviceMonitor?
 
 /// Flag to control whether callbacks should be processed.
@@ -25,12 +26,6 @@ import os
 /// This is Apple's recommended lock for performance-critical short critical sections.
 /// Note: os_unfair_lock must not be moved in memory after initialization - safe here as a global.
 @unsafe nonisolated(unsafe) private var gCallbackLock = os_unfair_lock()
-
-/// Reference to a DeviceMonitor pending cleanup.
-/// When a DeviceMonitor is stopped, it's moved here to keep it alive until
-/// the framework's internal thread has completed any in-flight callbacks.
-/// This prevents EXC_BAD_ACCESS from accessing a deallocated object.
-@unsafe nonisolated(unsafe) private var gPendingCleanup: DeviceMonitor?
 
 // MARK: - C Callback Function
 
@@ -82,6 +77,34 @@ import os
 
 // MARK: - DeviceMonitor
 
+/// Injectable boundary for testing device ownership and teardown without hardware.
+@unsafe struct MultitouchDeviceAPI {
+    var createList: () -> CFArray?
+    var createDefault: () -> CFTypeRef?
+    var register: (MTDeviceRef, MTContactCallbackFunction) -> Void
+    var unregister: (MTDeviceRef, MTContactCallbackFunction) -> Void
+    var start: (MTDeviceRef) -> Void
+    var isRunning: (MTDeviceRef) -> Bool
+    var stop: (MTDeviceRef) -> Void
+
+    static var live: Self {
+        unsafe Self(
+            createList: { MTDeviceCreateList() },
+            createDefault: {
+                guard let pointer = unsafe MTDeviceCreateDefault() else { return nil }
+                // The raw-pointer binding does not apply ARC's Core Foundation
+                // Create rule. Adopt the reference returned by CreateDefault.
+                return unsafe Unmanaged<CFTypeRef>.fromOpaque(pointer).takeRetainedValue()
+            },
+            register: { unsafe MTRegisterContactFrameCallback($0, $1) },
+            unregister: { unsafe MTUnregisterContactFrameCallback($0, $1) },
+            start: { unsafe MTDeviceStart($0, 0) },
+            isRunning: { unsafe MTDeviceIsRunning($0) },
+            stop: { unsafe MTDeviceStop($0) }
+        )
+    }
+}
+
 /// Monitors multitouch devices and reports touch events
 ///
 /// Note: This class uses unsafe pointer types (UnsafeMutableRawPointer) to interface
@@ -92,27 +115,21 @@ import os
 @unsafe @preconcurrency
 class DeviceMonitor: TouchDeviceProviding {
 
-    // MARK: - Constants
-
-    /// Delay between unregistering callbacks and stopping devices.
-    /// This allows the MultitouchSupport framework's internal thread (mt_ThreadedMTEntry)
-    /// to complete any in-flight callback processing before we stop devices.
-    static let frameworkCleanupDelay: TimeInterval = 1.0
-
     // MARK: - Properties
 
     /// Delegate to receive touch events
     weak var delegate: DeviceMonitorDelegate?
 
-    nonisolated(unsafe) private var device: MTDeviceRef?
+    private let api: MultitouchDeviceAPI
+    // CFArrayGetValueAtIndex returns borrowed pointers. Keep their owning array
+    // alive until every MTDeviceStop has returned, including across sleep/wake.
+    private var deviceListOwner: CFArray?
+    private var defaultDeviceOwner: CFTypeRef?
     nonisolated(unsafe) private var registeredDevices: Set<UnsafeMutableRawPointer> = unsafe []
     fileprivate var isRunning = false
 
     /// Lock to protect concurrent access to device state during stop/start operations
     fileprivate let stateLock = NSLock()
-
-    /// Tracks whether this instance owns the global callback reference
-    private var ownsGlobalReference = false
 
     /// Global lifecycle lock to serialize start/stop across instances.
     /// This prevents concurrent MTDeviceStart/MTDeviceStop calls, which can crash
@@ -121,34 +138,17 @@ class DeviceMonitor: TouchDeviceProviding {
 
     // MARK: - Lifecycle
 
-    init() {
-        // Acquire lock to safely update global state
-        unsafe os_unfair_lock_lock(&gCallbackLock)
-
-        // Release any previous pending cleanup reference
-        // The old instance has had time to complete cleanup by now
-        unsafe gPendingCleanup = nil
-
-        // Only take ownership of the global reference if no other instance owns it
-        // This prevents test interference when multiple DeviceMonitor instances are created
-        if unsafe gDeviceMonitor == nil {
-            unsafe gDeviceMonitor = unsafe self
-            unsafe ownsGlobalReference = true
-        }
-
-        unsafe os_unfair_lock_unlock(&gCallbackLock)
+    init(api: MultitouchDeviceAPI = unsafe .live) {
+        unsafe self.api = api
     }
 
     deinit {
-        // Ensure we've fully stopped monitoring and unregistered callbacks.
-        // All global cleanup (gDeviceMonitor, gPendingCleanup, etc.) is handled
-        // inside stop() under gCallbackLock to avoid taking locks in deinit.
         unsafe stop()
     }
 
     // MARK: - Public Interface
 
-    /// Start monitoring the default multitouch device
+    /// Start monitoring enumerated devices, falling back to the default device.
     @unsafe @discardableResult
     func start() -> Bool {
         unsafe DeviceMonitor.lifecycleLock.lock()
@@ -159,13 +159,20 @@ class DeviceMonitor: TouchDeviceProviding {
 
         guard unsafe !isRunning else { return true }
 
+        unsafe os_unfair_lock_lock(&gCallbackLock)
+        guard unsafe gDeviceMonitor == nil else {
+            unsafe os_unfair_lock_unlock(&gCallbackLock)
+            Log.warning("Another DeviceMonitor is already active", category: .device)
+            return false
+        }
+        unsafe gDeviceMonitor = self
+        unsafe gCallbackEnabled = false
+        unsafe os_unfair_lock_unlock(&gCallbackLock)
+
         Log.info("DeviceMonitor starting...", category: .device)
 
-        var deviceCount = 0
-        unsafe registeredDevices.removeAll()  // Clear any previous registrations
-
-        // Try to get all devices
-        if let deviceList = MTDeviceCreateList() {
+        unsafe deviceListOwner = api.createList()
+        if let deviceList = unsafe deviceListOwner {
             let count = CFArrayGetCount(deviceList)
             Log.info("Found \(count) multitouch device(s)", category: .device)
 
@@ -173,13 +180,9 @@ class DeviceMonitor: TouchDeviceProviding {
                 let devicePtr = unsafe CFArrayGetValueAtIndex(deviceList, i)
                 if let dev = unsafe devicePtr {
                     let deviceRef = unsafe UnsafeMutableRawPointer(mutating: dev)
-                    unsafe MTRegisterContactFrameCallback(deviceRef, deviceContactCallback)
-                    unsafe MTDeviceStart(deviceRef, 0)
-                    unsafe registeredDevices.insert(deviceRef)
-                    deviceCount += 1
-
-                    if unsafe device == nil {
-                        unsafe device = unsafe deviceRef
+                    if unsafe registeredDevices.insert(deviceRef).inserted {
+                        unsafe api.register(deviceRef, deviceContactCallback)
+                        unsafe api.start(deviceRef)
                     }
                 }
             }
@@ -187,30 +190,28 @@ class DeviceMonitor: TouchDeviceProviding {
             Log.warning("MTDeviceCreateList returned nil, trying default device", category: .device)
         }
 
-        // Also try the default device if not already registered
-        if let defaultDevice = unsafe MultitouchFramework.shared.getDefaultDevice() {
-            if unsafe !registeredDevices.contains(defaultDevice) {
-                unsafe MTRegisterContactFrameCallback(defaultDevice, deviceContactCallback)
-                unsafe MTDeviceStart(defaultDevice, 0)
-                unsafe registeredDevices.insert(defaultDevice)
-                deviceCount += 1
-
-                if unsafe device == nil {
-                    unsafe device = unsafe defaultDevice
-                }
-            } else {
-                Log.debug("Default device already registered from device list", category: .device)
-            }
+        // CreateDefault can return a different handle for the same physical
+        // trackpad. Only use it if enumeration did not supply any devices.
+        if unsafe registeredDevices.isEmpty, let owner = unsafe api.createDefault() {
+            unsafe defaultDeviceOwner = owner
+            let defaultDevice = unsafe Unmanaged.passUnretained(owner).toOpaque()
+            unsafe registeredDevices.insert(defaultDevice)
+            unsafe api.register(defaultDevice, deviceContactCallback)
+            unsafe api.start(defaultDevice)
         }
 
-        guard unsafe device != nil else {
+        guard unsafe !registeredDevices.isEmpty else {
+            unsafe deviceListOwner = nil
+            unsafe os_unfair_lock_lock(&gCallbackLock)
+            unsafe gDeviceMonitor = nil
+            unsafe os_unfair_lock_unlock(&gCallbackLock)
             Log.warning(
                 "No multitouch device found. MiddleDrag requires a built-in trackpad or Magic Trackpad.",
                 category: .device)
             return false
         }
 
-        Log.info("DeviceMonitor started with \(deviceCount) device(s)", category: .device)
+        Log.info(unsafe "DeviceMonitor started with \(registeredDevices.count) device(s)", category: .device)
 
         unsafe isRunning = true
 
@@ -227,94 +228,47 @@ class DeviceMonitor: TouchDeviceProviding {
     /// Safe to call even if start() was never called
     @unsafe func stop() {
         unsafe DeviceMonitor.lifecycleLock.lock()
+        defer { unsafe DeviceMonitor.lifecycleLock.unlock() }
         unsafe stateLock.lock()
 
-        // If not running, clean up global reference if we own it, then return.
-        // This handles the case where start() failed (no device found) so isRunning
-        // was never set to true, but init() already set gDeviceMonitor = self.
-        // Without this cleanup, the stale global reference prevents a subsequent
-        // DeviceMonitor from registering itself, causing callbacks to be dispatched
-        // to this dead instance (which silently drops them because isRunning = false).
         guard unsafe isRunning else {
-            if unsafe ownsGlobalReference {
-                unsafe os_unfair_lock_lock(&gCallbackLock)
-                if unsafe gDeviceMonitor === self {
-                    unsafe gDeviceMonitor = nil
-                }
-                unsafe ownsGlobalReference = false
-                unsafe os_unfair_lock_unlock(&gCallbackLock)
-            }
             unsafe stateLock.unlock()
-            unsafe DeviceMonitor.lifecycleLock.unlock()
             return
         }
 
         // Mark as not running FIRST to prevent callbacks from processing new events
         unsafe isRunning = false
 
-        // Copy the registered devices to a local variable so we can unlock before sleeping
         let devicesToStop = unsafe registeredDevices
+        let owners = unsafe (deviceListOwner, defaultDeviceOwner)
         unsafe registeredDevices.removeAll()
-        unsafe self.device = nil
+        unsafe deviceListOwner = nil
+        unsafe defaultDeviceOwner = nil
 
         unsafe stateLock.unlock()
 
-        // CRITICAL: Disable callbacks and handle global cleanup under lock.
-        // This must happen BEFORE unregistering callbacks with the framework,
-        // because the framework's internal thread (mt_ThreadedMTEntry) may still
-        // have in-flight callbacks that could access gDeviceMonitor.
-        // The lock synchronizes with the callback to ensure no callback is
-        // accessing gDeviceMonitor while we're tearing down.
         unsafe os_unfair_lock_lock(&gCallbackLock)
-        unsafe gCallbackEnabled = false
-
-        // Handle global cleanup: if this instance owns the global reference,
-        // move it to gPendingCleanup to keep it alive until the next DeviceMonitor
-        // is created. This prevents EXC_BAD_ACCESS if the framework's internal
-        // thread still has a reference to this callback and tries to invoke it.
-        if unsafe ownsGlobalReference && gDeviceMonitor === self {
-            unsafe gPendingCleanup = gDeviceMonitor
+        if unsafe gDeviceMonitor === self {
+            unsafe gCallbackEnabled = false
             unsafe gDeviceMonitor = nil
-            unsafe ownsGlobalReference = false
         }
         unsafe os_unfair_lock_unlock(&gCallbackLock)
 
-        // IMPORTANT: Unregister callbacks FIRST, before stopping devices
-        // This prevents the framework's internal thread (mt_ThreadedMTEntry)
-        // from receiving NEW callbacks while we're stopping devices.
-        for unsafe deviceRef in unsafe devicesToStop {
-            unsafe MTUnregisterContactFrameCallback(deviceRef, deviceContactCallback)
-        }
-
-        // Release lifecycle lock before sleeping so other start/stop callers don't
-        // block for the full framework cleanup delay.
-        unsafe DeviceMonitor.lifecycleLock.unlock()
-
-        // Brief pause to allow the framework's internal thread to complete
-        // any in-flight operations AFTER we've disabled callbacks and unregistered.
-        // Even with callbacks disabled, we still need to wait for any callback
-        // that was already dispatched but hasn't checked the flag yet.
-        // This sleep is intentionally done with lock unlocked to avoid blocking other threads.
-        unsafe Thread.sleep(forTimeInterval: Self.frameworkCleanupDelay)
-
-        // Reacquire lifecycle lock to serialize MTDeviceStop with MTDeviceStart/MTDeviceStop
-        // from any other DeviceMonitor instance.
-        unsafe DeviceMonitor.lifecycleLock.lock()
-        defer { unsafe DeviceMonitor.lifecycleLock.unlock() }
-
-        // Now safe to stop devices. Guard each stop with MTDeviceIsRunning to prevent
-        // CFRelease(NULL) → EXC_BREAKPOINT crashes: if the framework's internal thread
-        // (mt_ThreadedMTEntry) already tore down a device handle (e.g. during sleep/wake
-        // or physical disconnect), calling MTDeviceStop on the same handle causes a
-        // double-release of the underlying CF object, which CoreFoundation traps as
-        // CFRelease(NULL) in CFRelease.cold.2. Skipping the stop when the handle is
-        // already not-running closes this window without affecting normal teardown.
-        for unsafe deviceRef in unsafe devicesToStop {
-            unsafe os_unfair_lock_lock(&gCallbackLock)
-            if unsafe MTDeviceIsRunning(deviceRef) {
-                unsafe MTDeviceStop(deviceRef)
+        // The framework worker must not be the last owner while MTDeviceStop is
+        // executing: its final CFRelease would enter __MTDeviceRelease and stop
+        // the same device concurrently. Release our owners only after stop returns.
+        // Do not hold gCallbackLock here: MTDeviceStop may wait for a worker that
+        // is finishing a callback and needs that lock. Keep lifecycleLock held so
+        // another start cannot overlap this teardown.
+        withExtendedLifetime(owners) {
+            for unsafe deviceRef in unsafe devicesToStop {
+                unsafe api.unregister(deviceRef, deviceContactCallback)
             }
-            unsafe os_unfair_lock_unlock(&gCallbackLock)
+            for unsafe deviceRef in unsafe devicesToStop {
+                if unsafe api.isRunning(deviceRef) {
+                    unsafe api.stop(deviceRef)
+                }
+            }
         }
 
         Log.info("DeviceMonitor stopped", category: .device)
